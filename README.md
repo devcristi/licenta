@@ -1,120 +1,68 @@
-# 🧠 Brain Tumor Segmentation & Classification with Deep Learning
+# 🧠 licenta — Post-Treatment Adult Glioma (BraTS 2024) Segmentation + Longitudinal Analysis
 
-## Project Overview
+Bachelor thesis codebase for **3D deep learning on post-treatment adult glioma MRI** using **BraTS 2024 (BraTS-GLI)**, with optional transfer/longitudinal experiments on **LUMIERE**.
 
-Comprehensive deep learning project for **brain tumor segmentation and classification from MRI scans** with focus on:
-
-- **Automated segmentation** using 3D U-Net and CNN architectures
-- **Transfer learning** from BRATS → LUMIERE datasets
-- **Explainability (XAI)** with Grad-CAM and SHAP
-- **Robustness evaluation** against adversarial attacks
-- **Clinical-grade metrics** for medical imaging
-
-## 📊 Dataset Statistics
-
-### BRATS 2024
-- **Training**: 584 patients | 1,324 visits (80%)
-- **Validation**: 147 patients | 297 visits (20%)
-- **Test**: 87 patients | 188 visits
-- **Total**: 818 unique patients | 1,809 MRI sessions
-
-### LUMIERE
-- **Patients**: 90 with expert ratings
-- **Modalities**: T1, T1c, T2w, T2-FLAIR
-
-### MRI Sequences
-- T1 native (t1_path)
-- T1 contrast (t1c_path)
-- T2-weighted (t2w_path)
-- T2 FLAIR (t2_path)
-- Segmentation labels (seg_path)
-
-## 🏗️ Project Structure
-
-```
-dataset/
-  ├── BRATS/
-  │   ├── BraTS2024-BraTS-GLI-TrainingData/
-  │   ├── BraTS2024-BraTS-GLI-AdditionalTrainingData/
-  │   ├── BraTS2024-BraTS-GLI-ValidationData/
-  │   ├── brats_metadata.json
-  │   ├── brats_metadata_splits.json
-  │   └── brats_splits_statistics.json
-  └── LUMIERE/
-      ├── Imaging/ (Patient-001 to Patient-090)
-      └── LUMIERE-ExpertRating.csv
-
-scripts/
-  ├── process_brats_metadata.py
-  ├── analyze_brats_split.py
-  ├── create_train_val_split.py
-  ├── data_loader.ipynb
-  └── brats_visualization.ipynb
-```
-
-## 🚀 Quick Start
-
-### Setup
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### Generate Metadata
-```bash
-python scripts/process_brats_metadata.py
-python scripts/analyze_brats_split.py
-python scripts/create_train_val_split.py
-```
-
-## 📈 Training
-
-### Pre-training on BRATS
-```bash
-python models/training.py --dataset brats --epochs 100
-```
-
-### Fine-tuning on LUMIERE
-```bash
-python models/training.py --dataset lumiere --pretrained brats_model.pth
-```
-
-## 🔍 Explainability & Robustness
-
-### Grad-CAM Visualization
-```python
-from models.xai_explainability import GradCAM
-grad_cam = GradCAM(model)
-heatmap = grad_cam.generate(mri_scan)
-```
-
-### Robustness Testing
-```bash
-python models/robustness_evaluation.py --attack fgsm
-python models/robustness_evaluation.py --corruption gaussian_noise
-```
-
-## 📊 Evaluation Metrics
-
-- Dice Coefficient
-- Hausdorff Distance
-- Sensitivity/Specificity
-- AUC-ROC
-- Uncertainty Quantification
-
-## 📚 References
-
-- BRATS Dataset: [Medical Segmentation Decathlon](http://medicaldecathlon.com/)
-- U-Net: [Arxiv 1505.04597](https://arxiv.org/abs/1505.04597)
-- Grad-CAM: [Arxiv 1610.02055](https://arxiv.org/abs/1610.02055)
-- SHAP: [Arxiv 1705.07874](https://arxiv.org/abs/1705.07874)
-
-## 📝 License
-
-MIT License
+The core goal is to build a **clean, reproducible PyTorch pipeline** for **multi-modal 3D segmentation**, with **patient-level splitting** to avoid leakage across multiple visits/timepoints.
 
 ---
 
-**Status**: 🚀 In Development  
-**Last Updated**: December 2025
+## ✨ Project Highlights
+
+- **3D multi-modal tumor/subregion segmentation** (baseline: 3D U-Net style models)
+- **Patient-level split** (train/val), while training on **visits** (timepoints)
+- **Inference-only test set** (official BraTS Validation: no `seg`)
+- Dataset tooling:
+  - metadata parsing
+  - split analysis
+  - train/val split generation
+  - basic visualization notebooks
+
+> Note: The “official validation” in BraTS is **unlabeled** here, so supervised metrics are computed on an **internal validation split** sampled from trainable patients.
+
+---
+
+## 📊 Dataset Statistics (Current Split)
+
+### BraTS 2024 — BraTS-GLI (Post-Treatment)
+- 🔵 **TRAIN (internal)**: 584 patients | 1,324 visits  
+- 🟡 **VAL (internal)**: 147 patients | 297 visits  
+- 🔴 **TEST (official BraTS validation, unlabeled)**: 87 patients | 188 visits  
+- **Total**: 818 unique patients | 1,809 MRI sessions (visits)
+
+### MRI Sequences (per visit)
+- `t1n` — T1 native (non-contrast)
+- `t1c` — T1 contrast-enhanced
+- `t2w` — T2 weighted
+- `t2f` — T2 FLAIR
+- `seg` — segmentation label (**trainable splits only**)
+
+---
+
+## 🔑 Important: How the Split Works (No Leakage)
+
+BraTS includes multiple visits per patient (e.g., `...-100`, `...-101`, etc.).
+
+- **Indexing is visit-level** (one record per `subject_id`)
+- **Splitting is patient-level** (one patient belongs to exactly one split)
+- All visits of a patient stay together (prevents inflated metrics)
+
+---
+
+## 🗂️ Repository Structure
+
+```text
+.
+├─ dataset/
+│  └─ BRATS/
+│     ├─ brats_metadata.json
+│     ├─ brats_metadata_splits.json
+│     └─ brats_splits_statistics.json
+├─ scripts/
+│  ├─ process_brats_metadata.py
+│  ├─ analyze_brats_split.py
+│  ├─ create_train_val_split.py
+│  ├─ data_loader.ipynb
+│  └─ brats_visualization.ipynb
+├─ .gitignore
+├─ README.md
+└─ requirements.txt
