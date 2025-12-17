@@ -1,0 +1,10 @@
+Metric,Value
+Total Records (Visits),1809
+Training Records,1621
+Validation Records,188
+Unique Training Patients,731
+Unique Validation Patients,87
+Total Unique Patients,818
+Patients in Both Sets,0
+Avg Training Visits per Patient,2.22
+Avg Validation Visits per Patient,2.16

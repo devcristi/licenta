@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Large dataset folders (keep metadata only)
+dataset/BRATS/BraTS2024-BraTS-GLI-TrainingData/
+dataset/BRATS/BraTS2024-BraTS-GLI-AdditionalTrainingData/
+dataset/BRATS/BraTS2024-BraTS-GLI-ValidationData/
+dataset/LUMIERE/Imaging/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+models/checkpoints/
+models/pretrained/
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
