@@ -1,4 +1,4 @@
-# 🧠 licenta — Post-Treatment Adult Glioma (BraTS 2024) Segmentation + Longitudinal Analysis
+# 🧠 Bachelor thesis — Post-Treatment Adult Glioma (BraTS 2024) Segmentation + Longitudinal Analysis
 
 Bachelor thesis codebase for **3D deep learning on post-treatment adult glioma MRI** using **BraTS 2024 (BraTS-GLI)**, with optional transfer/longitudinal experiments on **LUMIERE**.
 
