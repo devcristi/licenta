@@ -37,17 +37,24 @@ env/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Large dataset folders (keep metadata only)
-dataset/BRATS/BraTS2024-BraTS-GLI-TrainingData/
-dataset/BRATS/BraTS2024-BraTS-GLI-AdditionalTrainingData/
-dataset/BRATS/BraTS2024-BraTS-GLI-ValidationData/
-dataset/LUMIERE/Imaging/
+# Large dataset folders
+dataset/
+checkpoints/
+visualizations/
+scripts/plots/
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Models
+*.pth
+*.onnx
+
+# Binaries
+*.exe
+*.o
+*.obj
 models/checkpoints/
 models/pretrained/
 *.pth
