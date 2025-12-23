@@ -82,13 +82,13 @@ train_transforms = Compose([
     # 5) normalizezi intensitatea pe nonzero, channel-wise (bun pentru MRI)
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 
-    # 6) patch sampling: scoți patch-uri mai mici pentru 6GB VRAM
+    # 6) patch sampling: focalizăm mai mult pe tumoră (SOTA improvement)
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
-        spatial_size=(96, 96, 96), # Redus de la 128 pentru a economisi memorie
-        pos=1, neg=1,
-        num_samples=2,          # Am crescut la 2 pentru a folosi mai bine volumul încărcat
+        spatial_size=(96, 96, 96), 
+        pos=3, neg=1,           # Am crescut raportul la 3:1 pentru a vedea mai multă tumoră
+        num_samples=2,          
         image_key="image",
         image_threshold=0
     ),
