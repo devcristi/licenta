@@ -2,13 +2,63 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
-from monai.data import CacheDataset, DataLoader, Dataset
+from monai.data import CacheDataset, DataLoader, Dataset, NibabelReader
 from monai.transforms import (
-    Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+    Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
     NormalizeIntensityd, RandCropByPosNegLabeld, RandFlipd,
-    RandAffined, EnsureTyped, Lambdad
+    EnsureTyped, Lambdad,
+    RandScaleIntensityd, RandShiftIntensityd,
+    RandGaussianNoised, RandBiasFieldd, RandAdjustContrastd,
+    RandSimulateLowResolutiond, RandGaussianSmoothd, RandZoomd,
+    RandKSpaceSpikeNoised,
 )
+
+# Fallback pentru RandChannelDropoutd dacă versiunea MONAI instalată nu îl exportă
+try:
+    from monai.transforms import RandChannelDropoutd
+except Exception:
+    import numpy as np
+    import torch
+    from monai.transforms import MapTransform, RandomizableTransform
+
+    class RandChannelDropoutd(RandomizableTransform, MapTransform):
+        """
+        Fallback simplu pentru a elimina (zero) canale/modalități ale imaginii.
+        Comportament: pentru fiecare canal din `channel_idxs`, cu probabilitate `prob`
+        îl setează la zero. Folosește RNG intern pentru reproducibilitate cu seed MONAI.
+        """
+        def __init__(self, keys, prob=0.1, channel_idxs=None, allow_missing_keys=False):
+            MapTransform.__init__(self, keys, allow_missing_keys)
+            RandomizableTransform.__init__(self)
+            self.prob = prob
+            self.channel_idxs = channel_idxs
+
+        def __call__(self, data):
+            d = dict(data)
+            for key in self.keys:
+                if key not in d:
+                    continue
+                img = d[key]
+                # Convertim la numpy pentru manipulare uniformă
+                was_torch = isinstance(img, torch.Tensor)
+                arr = img.detach().cpu().numpy() if was_torch else np.asarray(img)
+                # asigurăm axa canalului ca prima dimensiune
+                if arr.ndim < 4:
+                    # așteptăm shape (C, D, H, W)
+                    pass
+
+                ccount = arr.shape[0]
+                idxs = self.channel_idxs if self.channel_idxs is not None else list(range(ccount))
+                for c in idxs:
+                    if c < 0 or c >= ccount:
+                        continue
+                    if self.R.random() < self.prob:
+                        arr[c, ...] = 0
+
+                d[key] = torch.as_tensor(arr) if was_torch else arr
+            return d
 
 def build_brats2024_list_from_json(json_path: str, split: str = "train"):
     """
@@ -67,56 +117,69 @@ def remap_seg_0_1_2_4_to_0_1_2_3(x):
     return x
 
 train_transforms = Compose([
-    # 1) Load: dacă "image" e listă de path-uri => MONAI le încarcă și le stack-uiește pe canal (C=4)
-    LoadImaged(keys=["image", "label"]),
+    # --- 1. PREPARARE STRUCTURALĂ (PE CPU) ---
+    # Încărcăm imaginea cu precizie float32 și eticheta cu uint8 pentru a economisi memorie
+    LoadImaged(keys="image", reader=NibabelReader(dtype=np.float32)),
+    LoadImaged(keys="label", reader=NibabelReader(dtype=np.uint8)),
 
-    # 2) pune channel first: image -> [4, D, H, W], label -> [1, D, H, W]
     EnsureChannelFirstd(keys=["image", "label"]),
-
-    # 3) uniformizează orientarea (foarte util să eviți mismatch)
     Orientationd(keys=["image", "label"], axcodes="RAS"),
-
-    # 4) remap etichete 4->3 (opțional dar recomandat)
+    Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
+    
+    # Remap label ÎNAINTE de crop (0,1,2,4 -> 0,1,2,3)
     Lambdad(keys="label", func=remap_seg_0_1_2_4_to_0_1_2_3),
+    
+    # Asigurăm că datele sunt tensori PyTorch cu tipul corect DUPĂ manipulări numpy
+    EnsureTyped(keys=["image", "label"]),
 
-    # 5) normalizezi intensitatea pe nonzero, channel-wise (bun pentru MRI)
+    # Normalizăm intensitatea înainte de crop (stabilizează distribuția)
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 
-    # 6) patch sampling: focalizăm mai mult pe tumoră (SOTA improvement)
+    # --- 2. CROP DEVREME (CRITIC - reducem volumul ACUM) ---
+    # De aici încolo lucrăm doar cu cuburi mici (96x96x96) = ~27x mai puțin calcul
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
-        spatial_size=(96, 96, 96), 
-        pos=3, neg=1,           # Am crescut raportul la 3:1 pentru a vedea mai multă tumoră
-        num_samples=2,          
+        spatial_size=(96, 96, 96),
+        pos=4, neg=1, 
+        num_samples=1,
         image_key="image",
         image_threshold=0
     ),
 
-    # 7) augmentări simple și safe
+    # --- 3. AUGMENTĂRI PE PATCH-URI MICI (CPU, dar rapid acum!) ---
+    
+    # Augmentări Geometrice
     RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
     RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
     RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+    RandZoomd(keys=["image", "label"], min_zoom=0.9, max_zoom=1.1, mode=("trilinear", "nearest"), prob=0.3),
 
-    RandAffined(
-        keys=["image", "label"],
-        prob=0.2,
-        rotate_range=(0.1, 0.1, 0.1),
-        translate_range=(10, 10, 10),
-        scale_range=(0.1, 0.1, 0.1),
-        mode=("bilinear", "nearest"),
-        padding_mode="border",
-    ),
-
-    # 8) treci în torch.Tensor + metadata ok
+    # Augmentări de Intensitate / Artefacte (acum pe patch-uri mici = rapid)
+    RandBiasFieldd(keys=["image"], coeff_range=(0.2, 0.3), prob=0.3),
+    RandGaussianNoised(keys=["image"], prob=0.2, mean=0.0, std=0.1),
+    RandSimulateLowResolutiond(keys=["image"], zoom_range=(0.5, 1.0), prob=0.2),
+    RandKSpaceSpikeNoised(keys=["image"], prob=0.1, intensity_range=(5, 11)),
+    RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.5, 4.5)),
+    
+    # Modality Dropout
+    RandChannelDropoutd(keys=["image"], channel_idxs=[0, 1, 2, 3], prob=0.2),
+    
     EnsureTyped(keys=["image", "label"]),
 ])
 
 val_transforms = Compose([
-    LoadImaged(keys=["image", "label"]),
+    # Încărcăm imaginea cu precizie float32 și eticheta cu uint8 pentru a economisi memorie
+    LoadImaged(keys="image", reader=NibabelReader(dtype=np.float32)),
+    LoadImaged(keys="label", reader=NibabelReader(dtype=np.uint8)),
+
     EnsureChannelFirstd(keys=["image", "label"]),
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     Lambdad(keys="label", func=remap_seg_0_1_2_4_to_0_1_2_3),
+    
+    # Asigurăm că datele sunt tensori PyTorch cu tipul corect DUPĂ manipulări numpy
+    EnsureTyped(keys=["image", "label"]),
+
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     EnsureTyped(keys=["image", "label"]),
 ])

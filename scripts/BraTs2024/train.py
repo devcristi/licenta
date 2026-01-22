@@ -1,11 +1,19 @@
 import os
+# Reduce noisy logs from TensorFlow/oneDNN and silence Python warnings during training
+# Set before heavy imports that may trigger backend messages
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+import warnings
+warnings.filterwarnings("ignore")
+import random
 import torch
 from torch.cuda.amp import GradScaler, autocast
-from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric
+from monai.losses import DiceFocalLoss
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.data import DataLoader, Dataset, decollate_batch
 from monai.transforms import AsDiscrete, KeepLargestConnectedComponent, Compose
 from monai.utils import set_determinism
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 
 from data_loader import build_brats2024_list_from_json, train_transforms, val_transforms
@@ -14,7 +22,7 @@ from model import get_brats_model
 # --- Configurație SOTA ---
 CONFIG = {
     "json_path": "../../dataset/BRATS/brats_metadata_splits.json",
-    "batch_size": 2,           
+    "batch_size": 4,           
     "grad_accumulation": 2,    
     "epochs": 100,             
     "lr": 2e-4,
@@ -27,7 +35,7 @@ CONFIG = {
 def get_brats_regions(y):
     """
     Convertește cele 3 canale de tumoră în regiunile standard BraTS:
-    WT (Whole Tumor): 1, 2, 3
+    WT (Whole Tumor): 1, 2, 3 
     TC (Tumor Core): 1, 3
     ET (Enhancing Tumor): 3
     """ 
@@ -39,6 +47,9 @@ def get_brats_regions(y):
     return torch.cat([wt, tc, et], dim=1).float()
 
 def train():
+    # Inițializează TensorBoard
+    writer = SummaryWriter()
+    
     # Verificare extra pentru CUDA
     print(f"Checking CUDA inside script: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -48,6 +59,8 @@ def train():
 
     os.makedirs(CONFIG["model_dir"], exist_ok=True)
     set_determinism(seed=42)
+    # Optimize cuDNN for fixed-size inputs (may improve throughput)
+    torch.backends.cudnn.benchmark = True
 
     # 1. Data Loaders
     base_dir = Path(__file__).parent.parent.parent
@@ -55,6 +68,10 @@ def train():
     
     train_files = build_brats2024_list_from_json(str(json_path), split="train")
     val_files = build_brats2024_list_from_json(str(json_path), split="val_from_train")
+    
+    # Amestecă înainte să tai - ca să nu iei doar primii 20 care poate sunt toți de la același spital
+    random.seed(42)
+    random.shuffle(val_files)
     
     # Subset pentru validare rapidă (20 volume)
     val_files_subset = val_files[:20]
@@ -65,30 +82,30 @@ def train():
         train_ds, 
         batch_size=CONFIG["batch_size"], 
         shuffle=True, 
-        num_workers=4, 
+        num_workers=8, 
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=2
+        prefetch_factor=4
     )
 
     val_ds = Dataset(data=val_files_subset, transform=val_transforms)
     val_loader = DataLoader(
         val_ds, 
         batch_size=1, 
-        num_workers=2,
+        num_workers=4,
         persistent_workers=True
     )
 
     # 2. Model, Loss, Optimizer
     model = get_brats_model(in_channels=4, out_channels=4).to(CONFIG["device"])
     
-    # Loss SOTA: Dice + CrossEntropy cu greutăți pentru clasele mici
-    # Greutăți: BG=1, Necrotic=3, Edema=1, Enhancing=3
-    class_weights = torch.tensor([1.0, 3.0, 1.0, 3.0]).to(CONFIG["device"])
-    loss_function = DiceCELoss(
+    # DiceFocalLoss: Focal loss focusează pe exemple dificile, fără ponderi manuale
+    loss_function = DiceFocalLoss(
         smooth_nr=1e-5, smooth_dr=1e-5, 
         to_onehot_y=True, softmax=True,
-        weight=class_weights
+        gamma=2.0,           # Factor focal pentru exemple dificile
+        lambda_dice=1.0,     # Pondere Dice
+        lambda_focal=1.0     # Pondere Focal
     )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
@@ -132,6 +149,8 @@ def train():
     # Metrici SOTA: WT, TC, ET
     # include_background=True pentru că get_brats_regions returnează deja doar regiunile de interes
     dice_metric = DiceMetric(include_background=True, reduction="mean_batch")
+    hd95_metric = HausdorffDistanceMetric(include_background=True, reduction="mean_batch", percentile=95)
+
     post_seg = AsDiscrete(argmax=True, to_onehot=4)
     post_label = AsDiscrete(to_onehot=4)
     
@@ -144,6 +163,9 @@ def train():
         model.train()
         epoch_loss = 0
         step = 0
+        import time
+        last_log_time = time.perf_counter()
+        gpu_peak_mb = 0
         
         for batch_data in train_loader:
             step += 1
@@ -172,17 +194,48 @@ def train():
                 # Explicăm că Loss = Dice + CE (de aia e mai mare acum)
                 print(f"Ep {epoch+1} - Step {step}/{CONFIG['max_steps_per_epoch']} - Loss: {loss.item()*CONFIG['grad_accumulation']:.4f} (Dice+CE)")
 
+            # Periodic throughput / memory logging (every 10 steps)
+            if step % 10 == 0:
+                now = time.perf_counter()
+                elapsed = now - last_log_time
+                last_log_time = now
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / (1024**2)
+                    mem_reserved = torch.cuda.memory_reserved() / (1024**2)
+                    gpu_peak_mb = max(gpu_peak_mb, mem_reserved)
+                    print(f"  [Perf] step_time={elapsed:.3f}s | mem_alloc={mem_alloc:.1f}MB | mem_reserved={mem_reserved:.1f}MB | peak_reserved={gpu_peak_mb:.1f}MB")
+                else:
+                    print(f"  [Perf] step_time={elapsed:.3f}s")
+
             if step >= CONFIG["max_steps_per_epoch"]:
                 break
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch+1} Loss: {epoch_loss/step:.4f} | LR: {current_lr:.6f}")
+        avg_epoch_loss = epoch_loss / step
+        print(f"Epoch {epoch+1} Loss: {avg_epoch_loss:.4f} | LR: {current_lr:.6f}")
+        
+        # Logare în TensorBoard
+        writer.add_scalar("Loss/train", avg_epoch_loss, epoch + 1)
+        writer.add_scalar("learning_rate", current_lr, epoch + 1)
+
+        # Forțăm eliberarea memoriei înainte de validare, care este intensiv
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 3. Validare periodică cu TTA și Regiuni BraTS
         if (epoch + 1) % CONFIG["val_interval"] == 0:
             model.eval()
             with torch.no_grad():
+                run_hd95 = (epoch + 1) % 5 == 0
+                # Initialize accumulators for sensitivity/specificity per-class (WT, TC, ET)
+                sens_tp = [0, 0, 0]
+                sens_fp = [0, 0, 0]
+                sens_tn = [0, 0, 0]
+                sens_fn = [0, 0, 0]
+
                 for val_data in val_loader:
                     val_inputs, val_labels = val_data["image"].to(CONFIG["device"]), val_data["label"].to(CONFIG["device"])
                     
@@ -216,21 +269,83 @@ def train():
                     
                     for p, l in zip(val_outputs_regions, val_labels_regions):
                         dice_metric(y_pred=p, y=l)
+                        if run_hd95:
+                            hd95_metric(y_pred=p, y=l)
 
-                metric_batch = dice_metric.aggregate() 
+                        # accumulate TP/FP/TN/FN per class for sensitivity/specificity
+                        p_arr = p.squeeze(0)
+                        l_arr = l.squeeze(0)
+                        for ci in range(3):
+                            pred_mask = p_arr[ci] > 0
+                            label_mask = l_arr[ci] > 0
+                            tp = int((pred_mask & label_mask).sum().item())
+                            fp = int((pred_mask & (~label_mask)).sum().item())
+                            fn = int(((~pred_mask) & label_mask).sum().item())
+                            tn = int(((~pred_mask) & (~label_mask)).sum().item())
+                            sens_tp[ci] += tp
+                            sens_fp[ci] += fp
+                            sens_fn[ci] += fn
+                            sens_tn[ci] += tn
+
+                metric_batch_dice = dice_metric.aggregate()
                 dice_metric.reset()
-                
+
+                if run_hd95:
+                    metric_batch_hd95 = hd95_metric.aggregate()
+                    hd95_metric.reset()
+
+                # compute sensitivity and specificity per class from accumulators
+                metric_batch_sens_list = []
+                metric_batch_spec_list = []
+                for ci in range(3):
+                    tp = sens_tp[ci]
+                    fp = sens_fp[ci]
+                    fn = sens_fn[ci]
+                    tn = sens_tn[ci]
+                    sens = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+                    spec = (tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+                    metric_batch_sens_list.append(sens)
+                    metric_batch_spec_list.append(spec)
+
+                metric_batch_sens = torch.tensor(metric_batch_sens_list)
+                metric_batch_spec = torch.tensor(metric_batch_spec_list)
+
                 # Verificăm dimensiunea pentru a evita IndexError
-                if metric_batch.numel() >= 3:
-                    d_wt = metric_batch[0].item()
-                    d_tc = metric_batch[1].item()
-                    d_et = metric_batch[2].item()
+                if metric_batch_dice.numel() >= 3:
+                    d_wt, d_tc, d_et = metric_batch_dice[0].item(), metric_batch_dice[1].item(), metric_batch_dice[2].item()
+                    s_wt, s_tc, s_et = metric_batch_sens[0].item(), metric_batch_sens[1].item(), metric_batch_sens[2].item()
+                    sp_wt, sp_tc, sp_et = metric_batch_spec[0].item(), metric_batch_spec[1].item(), metric_batch_spec[2].item()
+                    
+                    if run_hd95 and metric_batch_hd95.numel() >= 3:
+                        h_wt, h_tc, h_et = metric_batch_hd95[0].item(), metric_batch_hd95[1].item(), metric_batch_hd95[2].item()
+                    else:
+                        h_wt, h_tc, h_et = -1.0, -1.0, -1.0
                 else:
-                    print(f"Warning: Metric batch size is {metric_batch.numel()}, expected 3.")
-                    d_wt = d_tc = d_et = metric_batch.mean().item() if metric_batch.numel() > 0 else 0
+                    # Fallback pentru cazul în care lipsește o clasă
+                    d_wt = d_tc = d_et = metric_batch_dice.mean().item() if metric_batch_dice.numel() > 0 else 0
+                    h_wt = h_tc = h_et = -1 # Valoare invalidă pentru HD95
+                    s_wt = s_tc = s_et = metric_batch_sens.mean().item() if metric_batch_sens.numel() > 0 else 0
+                    sp_wt = sp_tc = sp_et = metric_batch_spec.mean().item() if metric_batch_spec.numel() > 0 else 0
+
                 
                 avg_dice = (d_wt + d_tc + d_et) / 3
-                
+
+                # Logare în TensorBoard
+                writer.add_scalar("Dice/validation_WT", d_wt, epoch + 1)
+                writer.add_scalar("Dice/validation_TC", d_tc, epoch + 1)
+                writer.add_scalar("Dice/validation_ET", d_et, epoch + 1)
+                writer.add_scalar("Dice/validation_mean", avg_dice, epoch + 1)
+                if run_hd95:
+                    writer.add_scalar("HD95/validation_WT", h_wt, epoch + 1)
+                    writer.add_scalar("HD95/validation_TC", h_tc, epoch + 1)
+                    writer.add_scalar("HD95/validation_ET", h_et, epoch + 1)
+                writer.add_scalar("Sensitivity/validation_WT", s_wt, epoch + 1)
+                writer.add_scalar("Sensitivity/validation_TC", s_tc, epoch + 1)
+                writer.add_scalar("Sensitivity/validation_ET", s_et, epoch + 1)
+                writer.add_scalar("Specificity/validation_WT", sp_wt, epoch + 1)
+                writer.add_scalar("Specificity/validation_TC", sp_tc, epoch + 1)
+                writer.add_scalar("Specificity/validation_ET", sp_et, epoch + 1)
+
                 if avg_dice > best_metric:
                     best_metric = avg_dice
                     torch.save(model.state_dict(), os.path.join(CONFIG["model_dir"], "best_model.pth"))
@@ -244,17 +359,30 @@ def train():
                     'best_metric': best_metric,
                 }, checkpoint_path)
 
-                log_msg = (
-                    f"Epoca {epoch+1} - Mean WT/TC/ET: {avg_dice:.4f} | "
-                    f"WT: {d_wt:.4f}, TC: {d_tc:.4f}, ET: {d_et:.4f} | LR: {current_lr:.6f}\n"
+                log_msg_base = (
+                    f"Epoca {epoch+1} - Mean Dice: {avg_dice:.4f} | WT: {d_wt:.4f}, TC: {d_tc:.4f}, ET: {d_et:.4f} | "
+                    f"Sens WT: {s_wt:.4f}, TC: {s_tc:.4f}, ET: {s_et:.4f} | "
+                    f"Spec WT: {sp_wt:.4f}, TC: {sp_tc:.4f}, ET: {sp_et:.4f}"
                 )
+                if run_hd95:
+                    log_msg_hd = f" | HD95 WT: {h_wt:.4f}, TC: {h_tc:.4f}, ET: {h_et:.4f}"
+                    log_msg = log_msg_base + log_msg_hd + f" | LR: {current_lr:.6f}\n"
+                else:
+                    log_msg = log_msg_base + f" | LR: {current_lr:.6f}\n"
+
                 with open(os.path.join(CONFIG["model_dir"], "train_log.txt"), "a") as f:
                     f.write(log_msg)
 
                 print(f"Validare SOTA Ep {epoch+1}:")
-                print(f" > Whole Tumor (WT): {d_wt:.4f}")
-                print(f" > Tumor Core (TC): {d_tc:.4f}")
-                print(f" > Enhancing Tumor (ET): {d_et:.4f}")
+                print(f"  > Dice (WT/TC/ET): {d_wt:.4f} / {d_tc:.4f} / {d_et:.4f}  (Mean: {avg_dice:.4f})")
+                if run_hd95:
+                    print(f"  > HD95 (WT/TC/ET): {h_wt:.4f} / {h_tc:.4f} / {h_et:.4f}")
+                print(f"  > Sens (WT/TC/ET): {s_wt:.4f} / {s_tc:.4f} / {s_et:.4f}")
+                print(f"  > Spec (WT/TC/ET): {sp_wt:.4f} / {sp_tc:.4f} / {sp_et:.4f}")
+
+    
+    writer.close()
+    print("Antrenament finalizat și TensorBoard writer închis.")
 
 if __name__ == "__main__":
     train()

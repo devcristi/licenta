@@ -1,0 +1,10 @@
+{
+    "patient_id": "Patient-001",
+    "weeks": [
+        "week-000-1",
+        "week-000-2",
+        "week-044",
+        "week-056"
+    ],
+    "volumes_mm3": [
+        
