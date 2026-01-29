@@ -82,7 +82,7 @@ val_transforms = Compose([
 ])
 
 def run_gradcam(patient_idx=0):
-    print(f"Încărcăm modelul din: {MODEL_PATH}")
+    print(f"Incarcam modelul din: {MODEL_PATH}")
     
     model = get_brats_model(in_channels=4, out_channels=4).to(DEVICE)
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
@@ -98,7 +98,7 @@ def run_gradcam(patient_idx=0):
     test_data = [metadata[patient_idx]]
     subject_id = test_data[0].get('subject_id', f"Patient-{patient_idx:03d}")
     week = test_data[0].get('week', 'unknown')
-    print(f"Analizăm pacientul: {subject_id} - {week}")
+    print(f"Analizam pacientul: {subject_id} - {week}")
     
     ds = Dataset(data=test_data, transform=val_transforms)
     loader = DataLoader(ds, batch_size=1)
@@ -189,10 +189,10 @@ def run_gradcam(patient_idx=0):
         plt.savefig(out_path, dpi=250, facecolor='black', bbox_inches='tight')
         plt.close()
         
-        print(f"✅ Imagine salvată: {out_path}")
+        print(f"Imagine salvata: {out_path}")
         
     except Exception as e:
-        print(f"❌ Eroare: {e}")
+        print(f"Eroare: {e}")
         import traceback
         traceback.print_exc()
 

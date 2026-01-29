@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import random
 import torch
+from datetime import datetime
 from torch.cuda.amp import GradScaler, autocast
 from monai.losses import DiceFocalLoss
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
@@ -24,7 +25,7 @@ CONFIG = {
     "json_path": "../../dataset/BRATS/brats_metadata_splits.json",
     "batch_size": 4,           
     "grad_accumulation": 2,    
-    "epochs": 100,             
+    "epochs": 200,             
     "lr": 2e-4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "model_dir": "D:/study/licenta/creier/checkpoints", # Cale absolută
@@ -99,14 +100,43 @@ def train():
     # 2. Model, Loss, Optimizer
     model = get_brats_model(in_channels=4, out_channels=4).to(CONFIG["device"])
     
-    # DiceFocalLoss: Focal loss focusează pe exemple dificile, fără ponderi manuale
-    loss_function = DiceFocalLoss(
-        smooth_nr=1e-5, smooth_dr=1e-5, 
-        to_onehot_y=True, softmax=True,
-        gamma=2.0,           # Factor focal pentru exemple dificile
-        lambda_dice=1.0,     # Pondere Dice
-        lambda_focal=1.0     # Pondere Focal
-    )
+    # Selectare loss: păstrăm DiceFocalLoss implicit, dar permitem Focal Tversky
+    use_tversky = os.environ.get('TVERSKY_LOSS', '0') == '1'
+
+    if use_tversky:
+        class FocalTverskyLoss(torch.nn.Module):
+            def __init__(self, alpha=0.3, beta=0.7, gamma=1.33, eps=1e-7):
+                super().__init__()
+                self.alpha = alpha
+                self.beta = beta
+                self.gamma = gamma
+                self.eps = eps
+
+            def forward(self, inputs, targets):
+                probs = torch.softmax(inputs, dim=1)
+                p = probs.view(probs.size(0), probs.size(1), -1)
+                t = targets.view(targets.size(0), targets.size(1), -1)
+                tp = (p * t).sum(-1)
+                fp = (p * (1 - t)).sum(-1)
+                fn = ((1 - p) * t).sum(-1)
+                tversky = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+                loss = (1 - tversky) ** self.gamma
+                return loss.mean()
+
+        loss_function = FocalTverskyLoss(alpha=0.3, beta=0.7, gamma=1.33)
+        print("Using Focal Tversky Loss for training. Alpha: 0.3, Beta: 0.7, Gamma: 1.33")
+        # directory for saving Tversky-run artifacts (never overwrite existing files)
+        TVERSKY_DIR = os.path.join(CONFIG["model_dir"], "tversky_loss")
+        os.makedirs(TVERSKY_DIR, exist_ok=True)
+    else:
+        # DiceFocalLoss: Focal loss focusează pe exemple dificile, fără ponderi manuale
+        loss_function = DiceFocalLoss(
+            smooth_nr=1e-5, smooth_dr=1e-5, 
+            to_onehot_y=True, softmax=True,
+            gamma=2.0,           # Factor focal pentru exemple dificile
+            lambda_dice=1.0,     # Pondere Dice
+            lambda_focal=1.0     # Pondere Focal
+        )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
     
@@ -118,31 +148,35 @@ def train():
     start_epoch = 0
     best_metric = -1
     checkpoint_path = os.path.join(CONFIG["model_dir"], "latest_checkpoint.pth")
-    
-    if os.path.exists(checkpoint_path):
-        print(f"Reluăm antrenarea de la checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=CONFIG["device"])
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_metric = checkpoint['best_metric']
-        print(f"Continuăm de la Epoca {start_epoch} (Best Dice: {best_metric:.4f})")
-    elif os.path.exists(os.path.join(CONFIG["model_dir"], "best_model.pth")):
-        print("Incarcam greutatile din best_model.pth")
-        model.load_state_dict(torch.load(os.path.join(CONFIG["model_dir"], "best_model.pth"), map_location=CONFIG["device"]))
-        # Încercăm să detectăm epoca din log dacă nu avem checkpoint
-        log_path = os.path.join(CONFIG["model_dir"], "train_log.txt")
-        if os.path.exists(log_path):
-            with open(log_path, "r") as f:
-                lines = f.readlines()
-                if lines:
-                    last_line = lines[-1]
-                    if "Epoca" in last_line:
-                        try:
-                            start_epoch = int(last_line.split(" ")[1])
-                            print(f"Detectat din log: Continuăm de la Epoca {start_epoch}")
-                        except: pass
+
+    # If running with TVERSKY_LOSS we want a fresh start (do not resume)
+    if use_tversky:
+        print("TVERSKY_LOSS=1 detected — starting training from scratch (ignoring existing checkpoints).")
+    else:
+        if os.path.exists(checkpoint_path):
+            print(f"Reluăm antrenarea de la checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=CONFIG["device"])
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_metric = checkpoint['best_metric']
+            print(f"Continuăm de la Epoca {start_epoch} (Best Dice: {best_metric:.4f})")
+        elif os.path.exists(os.path.join(CONFIG["model_dir"], "best_model.pth")):
+            print("Incarcam greutatile din best_model.pth")
+            model.load_state_dict(torch.load(os.path.join(CONFIG["model_dir"], "best_model.pth"), map_location=CONFIG["device"]))
+            # Încercăm să detectăm epoca din log dacă nu avem checkpoint
+            log_path = os.path.join(CONFIG["model_dir"], "train_log.txt")
+            if os.path.exists(log_path):
+                with open(log_path, "r") as f:
+                    lines = f.readlines()
+                    if lines:
+                        last_line = lines[-1]
+                        if "Epoca" in last_line:
+                            try:
+                                start_epoch = int(last_line.split(" ")[1])
+                                print(f"Detectat din log: Continuăm de la Epoca {start_epoch}")
+                            except: pass
     
     scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
@@ -191,8 +225,10 @@ def train():
             epoch_loss += loss.item() * CONFIG["grad_accumulation"]
             
             if step % 50 == 0:
-                # Explicăm că Loss = Dice + CE (de aia e mai mare acum)
-                print(f"Ep {epoch+1} - Step {step}/{CONFIG['max_steps_per_epoch']} - Loss: {loss.item()*CONFIG['grad_accumulation']:.4f} (Dice+CE)")
+                # Print current loss value and loss type (not Dice metric)
+                loss_value = loss.item() * CONFIG["grad_accumulation"]
+                loss_name = "Tversky" if use_tversky else "DiceFocal"
+                print(f"Ep {epoch+1} - Step {step}/{CONFIG['max_steps_per_epoch']} - Loss ({loss_name}): {loss_value:.4f}")
 
             # Periodic throughput / memory logging (every 10 steps)
             if step % 10 == 0:
@@ -349,7 +385,53 @@ def train():
                 if avg_dice > best_metric:
                     best_metric = avg_dice
                     torch.save(model.state_dict(), os.path.join(CONFIG["model_dir"], "best_model.pth"))
-                    print(f"*** SOTA Model salvat! Mean Dice (WT/TC/ET): {avg_dice:.4f} ***")
+                    print(f"*** SOTA Model salvat! Mean Dice (WT/TC/ET): {avg_dice:.4f} ***)")
+                    # If running with Tversky loss, also keep a timestamped copy in TVERSKY_DIR
+                    if 'use_tversky' in locals() and use_tversky:
+                        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        bm_copy = os.path.join(TVERSKY_DIR, f"best_model_epoch{epoch+1}_{ts}.pth")
+                        try:
+                            torch.save(model.state_dict(), bm_copy)
+                            with open(os.path.join(TVERSKY_DIR, f"best_model_epoch{epoch+1}_{ts}.txt"), 'w', encoding='utf-8') as mf:
+                                mf.write(f"epoch: {epoch+1}\nmean_dice: {avg_dice:.6f}\nsaved_at: {ts}\n")
+                        except Exception:
+                            print(f"Warning: couldn't save best-model copy to {TVERSKY_DIR}")
+
+                # Save per-epoch full checkpoint (model + optimizer + scheduler + metadata)
+                epoch_checkpoint_path = os.path.join(CONFIG["model_dir"], f"checkpoint_epoch{epoch+1}.pth")
+                epoch_model_path = os.path.join(CONFIG["model_dir"], f"model_epoch{epoch+1}.pth")
+                try:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'best_metric': best_metric,
+                    }, epoch_checkpoint_path)
+                    # also keep a lightweight model-only copy for quick loading
+                    torch.save(model.state_dict(), epoch_model_path)
+                    # If Tversky mode, also save non-overwriting timestamped copies in TVERSKY_DIR
+                    if 'use_tversky' in locals() and use_tversky:
+                        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        ckpt_copy = os.path.join(TVERSKY_DIR, f"checkpoint_epoch{epoch+1}_{ts}.pth")
+                        model_copy = os.path.join(TVERSKY_DIR, f"model_epoch{epoch+1}_{ts}.pth")
+                        try:
+                            torch.save({
+                                'epoch': epoch,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'best_metric': best_metric,
+                            }, ckpt_copy)
+                            torch.save(model.state_dict(), model_copy)
+                            # also write a small metrics text file for quick scanning
+                            with open(os.path.join(TVERSKY_DIR, f"metrics_epoch{epoch+1}_{ts}.txt"), 'w', encoding='utf-8') as mf:
+                                mf.write(f"epoch: {epoch+1}\nmean_dice: {avg_dice:.6f}\nlr: {current_lr:.8f}\nsaved_at: {ts}\n")
+                        except Exception:
+                            print(f"Warning: couldn't save per-epoch copies to {TVERSKY_DIR}")
+                except Exception as e:
+                    # best-effort: don't break training if disk I/O fails
+                    print(f"Warning: failed to save per-epoch checkpoint or model: {e}")
                 
                 torch.save({
                     'epoch': epoch,

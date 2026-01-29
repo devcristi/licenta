@@ -27,7 +27,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 # --- CONFIGURARE ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BRATS_PRETRAINED = os.environ.get('BRATS_PRETRAINED', r"D:/study/licenta/creier/checkpoints/best_model_epoch44.pth")
+BRATS_PRETRAINED = os.environ.get('BRATS_PRETRAINED', r"D:/study/licenta/creier/checkpoints/model_epoch70.pth")
 LUMIERE_JSON = r"D:/study/licenta/creier/dataset/LUMIERE/lumiere_metadata.json"
 CHECKPOINT_DIR = r"D:/study/licenta/creier/checkpoints/lumiere_cv"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
