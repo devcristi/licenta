@@ -192,7 +192,10 @@ def train():
     post_processing_et = KeepLargestConnectedComponent(applied_labels=[3])
 
     print(f"Start Training SOTA! Device: {CONFIG['device']}")
-
+    # TEST RAPID INAINTE DE DECOLARE
+    test_batch = next(iter(train_loader))
+    print(f"🚀 Verificare Batch: Imagine {test_batch['image'].shape}, Label {test_batch['label'].shape}")
+    # Ar trebui sa vezi: torch.Size([6, 4, 128, 128, 128]) si torch.Size([6, 1, 128, 128, 128])
     for epoch in range(start_epoch, CONFIG["epochs"]):
         model.train()
         epoch_loss = 0
